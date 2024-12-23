@@ -1,0 +1,464 @@
+import os
+import torch
+import argparse
+import warnings
+import torchvision
+import numpy as np
+import matplotlib.cm as cm
+import matplotlib.pyplot as plt
+import torch.nn.functional as F
+
+from skimage import io
+from torch import nn
+from tqdm import tqdm
+from torch.fft import fftn, ifftn, fftshift, ifftshift
+from torch.utils.data import DataLoader
+from torchmetrics import TotalVariation
+from torchvision.utils import save_image, make_grid
+from torch.utils.tensorboard import SummaryWriter
+
+from model_UNetv8 import UNet_3Plus_for_S, UNet_3Plus_for_X_train, STN, Discriminator, MLP
+from synthetic_dataloader_3Dpre import LineDataset_S_is_added_Multiple_updates, LineDataset_valid
+
+warnings.filterwarnings("ignore")
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--epoch', type=int, default=50, help='number of training epochs')
+parser.add_argument("--valid_save_period", type=int, default=50, help='save the valid results for every N epochs')
+parser.add_argument("--model_save_period", type=int, default=50, help='save the model pth file for every N epochs')
+
+parser.add_argument("--lrDisX", type=float, default=1e-5, help="Discriminator learning rate")
+parser.add_argument("--lrDisS", type=float, default=1e-5, help="Discriminator learning rate")
+parser.add_argument("--lrUNetX", type=float, default=1e-4, help="UNet_3Plus learning rate")
+parser.add_argument("--lrUNetS", type=float, default=1e-4, help="UNet_3Plus learning rate")
+parser.add_argument("--lrSTN", type=float, default=1e-4, help="STN learning rate")
+
+parser.add_argument("--weight_decay", type=float, default=1e-6, help="weight decay of optimizer")
+parser.add_argument("--patch_size", type=int, default=256, help="training patch size")
+parser.add_argument("--batch_size", type=int, default=4, help="training batch size")
+parser.add_argument("--valid_batch_size", type=int, default=5, help="validation image saving batch size")
+
+parser.add_argument("--in_dir", type=str, default='./dataset/230817_LSM_simulation/230817_input_Y_110vol.tif', help="dataset path")
+parser.add_argument("--synthetic_S_dir", type=str, default='./dataset/230817_LSM_simulation/230817_synthetic_S_110vol.tif')
+parser.add_argument("--gt_dir", type=str, default='./dataset/230817_LSM_simulation/230817_gt_110vol.tif')
+parser.add_argument("--valid_idx_path", type=str, default='./dataset/230817_LSM_simulation/index_list.txt')
+parser.add_argument("--out_dir", type=str, default='./230905_00', help='hyperparameters are saved at the end automatically')
+
+parser.add_argument("--nz", type=int, default=4, help="size of the Gaussian random noise (input of GAN), shape: (nz, nz)")
+parser.add_argument("--num_G", type=int, default=5, help="number of Generator learning iterations")
+parser.add_argument("--c", type=float, default=1, help="weight for loss4 (UNet_X, Generator loss for X)")
+parser.add_argument("--d", type=float, default=1, help="weight for loss5 (UNet_S, Generator loss for S)")
+
+opt = parser.parse_args()
+writer = SummaryWriter(log_dir="log/{}".format(opt.out_dir[2:11]))
+
+# save path
+root = f'{opt.out_dir}_GANfromGaussian_G{opt.num_G}_{opt.c}_{opt.d}_lrDX_{opt.lrDisX}_lrDS_{opt.lrDisS}_lrUX_{opt.lrUNetX}_lrUS_{opt.lrUNetS}'
+model_path = root + '/saved_models'
+plot_path = root + '/loss_curve'
+image_path = root + '/output_images'
+temp_path = root + '/temp'
+os.makedirs(model_path, exist_ok=True)
+os.makedirs(plot_path, exist_ok=True)
+os.makedirs(image_path, exist_ok=True)
+os.makedirs(temp_path, exist_ok=True)
+
+# Prepare for use of CUDA
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Dataloader
+train_data = LineDataset_S_is_added_Multiple_updates(img_path=opt.in_dir, synthetic_S_path=opt.synthetic_S_dir, gt_path=opt.gt_dir, patch_size=opt.patch_size, num_update=opt.num_G)
+train_loader = DataLoader(dataset=train_data, batch_size=opt.batch_size, shuffle=True)
+valid_data = LineDataset_valid(index_path=opt.valid_idx_path, valid_path=opt.in_dir, synthetic_S_path=opt.synthetic_S_dir, gt_path=opt.gt_dir, patch_size=opt.patch_size)
+valid_loader = DataLoader(dataset=valid_data, batch_size=opt.valid_batch_size, shuffle=False)
+
+# Define models
+modelUNet_for_S = UNet_3Plus_for_S(in_channels=1, out_channels=1, feature_scale=4, is_deconv=True, is_batchnorm=True)
+modelUNet_for_X = UNet_3Plus_for_X_train(in_channels=1, out_channels=1, feature_scale=4, is_deconv=True, is_batchnorm=True)
+modelDiscriminator_for_S = Discriminator(input_dim=1, n_layer=3, dim=64, activ='relu', pad='zero', num_scales=2)
+modelDiscriminator_for_X = Discriminator(input_dim=1, n_layer=3, dim=64, activ='relu', pad='zero', num_scales=2)
+modelMLP = MLP(nz=opt.nz, patch=opt.patch_size)
+
+# If you use MULTIPLE GPUs, use 'DataParallel'
+modelUNet_for_S = nn.DataParallel(modelUNet_for_S)
+modelUNet_for_X = nn.DataParallel(modelUNet_for_X)
+modelDiscriminator_for_S = nn.DataParallel(modelDiscriminator_for_S)
+modelDiscriminator_for_X = nn.DataParallel(modelDiscriminator_for_X)
+modelMLP = nn.DataParallel(modelMLP)
+
+# to device
+modelUNet_for_S = modelUNet_for_S.to(device)
+modelUNet_for_X = modelUNet_for_X.to(device)
+modelDiscriminator_for_S = modelDiscriminator_for_S.to(device)
+modelDiscriminator_for_X = modelDiscriminator_for_X.to(device)
+modelMLP = modelMLP.to(device)
+
+# Loss function for L1 loss (reconstruction loss)
+criterion = nn.MSELoss().to(device)
+criterion_BCE = nn.BCELoss().to(device)
+
+# Total variation
+tv = TotalVariation(reduction='mean').to(device)
+
+# optimizers
+optimUNet_for_S = torch.optim.Adam(modelUNet_for_S.parameters(), lr=opt.lrUNetS, weight_decay=opt.weight_decay)
+optimUNet_for_X = torch.optim.Adam(modelUNet_for_X.parameters(), lr=opt.lrUNetX, weight_decay=opt.weight_decay)
+optimDiscriminator_for_S = torch.optim.Adam(modelDiscriminator_for_S.parameters(), lr=opt.lrDisS, weight_decay=opt.weight_decay)
+optimDiscriminator_for_X = torch.optim.Adam(modelDiscriminator_for_X.parameters(), lr=opt.lrDisX, weight_decay=opt.weight_decay)
+
+# schedulers
+schedulerUNet_for_S = torch.optim.lr_scheduler.StepLR(optimUNet_for_S, step_size=50, gamma=0.5)
+schedulerUNet_for_X = torch.optim.lr_scheduler.StepLR(optimUNet_for_X, step_size=50, gamma=0.5)
+schedulerDiscriminator_for_S = torch.optim.lr_scheduler.StepLR(optimDiscriminator_for_S, step_size=50, gamma=0.5)
+schedulerDiscriminator_for_X = torch.optim.lr_scheduler.StepLR(optimDiscriminator_for_X, step_size=50, gamma=0.5)
+
+# To draw loss graph
+train_loss_ep = []
+train_loss1_ep = []
+train_loss2_ep = []
+train_loss3_ep = []
+train_loss4_ep = []
+train_loss5_ep = []
+train_lossDisX_ep = []
+train_lossDisS_ep = []
+epoch_ep = []
+
+### loss for check if 'GT' and our 'output X' is same. ###
+total_loss_check_train_ep = []
+total_loss_check_valid_ep = []
+##########################################################
+
+### train
+for e in range(opt.epoch):
+    epoch_ep.append(e + 1)
+
+    modelUNet_for_X.train()
+    modelUNet_for_S.train()
+    modelDiscriminator_for_S.train()
+    modelDiscriminator_for_X.train()
+
+    total_train_loss = 0
+    total_loss1 = []
+    total_loss2 = []
+    total_loss3 = []
+    total_loss4 = []
+    total_loss5 = []
+    total_lossDisX = []
+    total_lossDisS = []
+
+    ### loss for check if 'GT' and our 'output X' is same. ###
+    total_loss_check_train = []
+    total_loss_check_valid = []
+    ##########################################################
+
+    for i, datas in enumerate(train_loader):
+        # Dataloader = (img, synthetic S)
+        _, synthetic_S, gt = datas
+
+        # (b, h, w) --> (b, c, h, w) in this case, (b, h, w) --> (b, 1, h, w)
+        img = torch.randn((gt.shape[0], 1, 1, opt.nz)).to(device)
+        img = torch.reshape(modelMLP(img), (gt.shape[0], 1, opt.patch_size, opt.patch_size))
+        img2 = torch.randn((gt.shape[0], 1, 1, opt.nz)).to(device)
+        img2 = torch.reshape(modelMLP(img2), (gt.shape[0], 1, opt.patch_size, opt.patch_size))
+        synthetic_S = synthetic_S.unsqueeze(1)
+        gt = gt.unsqueeze(1)
+
+        # Normalize using 99% percentile value (0~65525 -> 0~1.6)
+        high_gt = torch.quantile(gt, 0.99)
+        gt = gt / high_gt
+
+        # Normalize synthetic S using max value (0~65525 -> 0.5~1) --> normalize [a, b] = (b-a)*(x-Minx)/(Maxx-Minx)+a
+        high_s = torch.max(synthetic_S)
+        synthetic_S = synthetic_S / high_s
+        # (optional) to make sure that 'synthetic S' has values more than 0.1 at least.
+        synthetic_S = torch.maximum(synthetic_S, torch.ones_like(synthetic_S) * 0.1)
+
+        synthetic_S = synthetic_S.to(device)
+        gt = gt.to(device)
+
+        # 1. Y'' --[Enc1]-> 1D vector S --[extend]-> S'
+        _, mask = modelUNet_for_S(img)
+
+        # 2. Y'' --[Enc2]-> 2D feature X --[Dec2]-> X'
+        output = modelUNet_for_X(img2)
+
+        # 3. {X, rotated X} --[Discriminator_for_X]-> 0/1
+        dis_outputX = modelDiscriminator_for_X(output.detach())
+        dis_outputX_rotated = modelDiscriminator_for_X(gt.detach())
+
+        # 4. {S, synthetic S} --[Discriminator_for_S]-> 0/1
+        dis_outputS = modelDiscriminator_for_S(mask.detach())
+        dis_outputS_synthetic = modelDiscriminator_for_S(synthetic_S.detach())
+
+        tensor_one = torch.ones_like(dis_outputX).to(device)
+        tensor_zero = torch.zeros_like(dis_outputX).to(device)
+
+        # loss4: GAN loss for UNet_for_X
+        loss4 = opt.c * criterion_BCE(dis_outputX, tensor_one)
+        # GAN loss for Discriminator X
+        lossDisX = (criterion_BCE(dis_outputX_rotated, tensor_one) + criterion_BCE(dis_outputX, tensor_zero))/2
+        # loss5: GAN loss for UNet_for_S
+        loss5 = opt.d * criterion_BCE(dis_outputS, tensor_one)
+        # GAN loss for Discriminator S
+        lossDisS = (criterion_BCE(dis_outputS_synthetic, tensor_one) + criterion_BCE(dis_outputS, tensor_zero))/2
+
+        # Now, we use only loss1 to update three networks.
+        loss_UNet = loss4 + loss5
+        loss_Discriminator_for_X = lossDisX
+        loss_Discriminator_for_S = lossDisS
+
+        # to print loss values
+        total_loss4.append(loss4.item())
+        total_loss5.append(loss5.item())
+        total_lossDisX.append(lossDisX.item())
+        total_lossDisS.append(lossDisS.item())
+
+        optimUNet_for_X.zero_grad()
+        optimUNet_for_S.zero_grad()
+        loss_UNet.backward(retain_graph=True)
+        optimUNet_for_X.step()
+        optimUNet_for_S.step()
+
+        if i % opt.num_G == 0:
+            optimDiscriminator_for_X.zero_grad()
+            loss_Discriminator_for_X.backward(retain_graph=True)
+            optimDiscriminator_for_X.step()
+
+            optimDiscriminator_for_S.zero_grad()
+            loss_Discriminator_for_S.backward(retain_graph=True)
+            optimDiscriminator_for_S.step()
+
+            schedulerUNet_for_X.step()
+            schedulerUNet_for_S.step()
+            schedulerDiscriminator_for_X.step()
+            schedulerDiscriminator_for_S.step()
+
+            ### loss for check if 'GT' and our 'output X' is same. ###
+            loss_check_train = criterion(gt, output)
+            total_loss_check_train.append(loss_check_train.item())
+            ##########################################################
+
+    total_loss1 = 0
+    total_loss2 = 0
+    total_loss3 = 0
+    total_loss4 = sum(total_loss4) / len(total_loss4)
+    total_loss5 = sum(total_loss5) / len(total_loss5)
+    total_lossDisX = sum(total_lossDisX) / len(total_lossDisX)
+    total_lossDisS = sum(total_lossDisS) / len(total_lossDisS)
+
+    ### loss for check if 'GT' and our 'output X' is same. ###
+    total_loss_check_train = sum(total_loss_check_train) / len(total_loss_check_train)
+    ##########################################################
+
+    total_train_loss = total_loss4 + total_loss5
+
+    print(f'Epoch: {e + 1} / {opt.epoch}, Total_loss: {total_train_loss:.3f}, Loss1: {total_loss1:.3f}, '
+          f'Loss2: {total_loss2:.3f}, Loss3: {total_loss3:.3f}, Loss4: {total_loss4:.3f}, Loss5: {total_loss5:.3f}')
+    print(f'Loss_for_DisX: {total_lossDisX:.3f}, Loss_for_DisS: {total_lossDisS:.3f}')
+
+    train_loss_ep.append(total_train_loss)
+    train_loss1_ep.append(total_loss1)
+    train_loss2_ep.append(total_loss2)
+    train_loss3_ep.append(total_loss3)
+    train_loss4_ep.append(total_loss4)
+    train_loss5_ep.append(total_loss5)
+    train_lossDisX_ep.append(total_lossDisX)
+    train_lossDisS_ep.append(total_lossDisS)
+
+    ### loss for check if 'GT' and our 'output X' is same. ###
+    total_loss_check_train_ep.append(total_loss_check_train)
+    ##########################################################
+
+    writer.add_scalar('Total train loss', total_train_loss, e)
+    writer.add_scalar('Loss1', total_loss1, e)
+    writer.add_scalar('Loss2', total_loss2, e)
+    writer.add_scalar('Loss3', total_loss3, e)
+    writer.add_scalar('Loss4', total_loss4, e)
+    writer.add_scalar('Loss5', total_loss5, e)
+    writer.add_scalar('Loss DisX', total_lossDisX, e)
+    writer.add_scalar('Loss DisS', total_lossDisS, e)
+
+    ### Validation
+    modelUNet_for_S.eval()
+    modelUNet_for_X.eval()
+    modelDiscriminator_for_S.eval()
+    modelDiscriminator_for_X.eval()
+
+    if (e + 1) % opt.valid_save_period == 0:
+        valid_save_path = f'{image_path}/epoch{e + 1}'
+        valid_array_save_path = f'{temp_path}/epoch{e+1}'
+        os.makedirs(valid_save_path, exist_ok=True)
+        os.makedirs(valid_array_save_path, exist_ok=True)
+
+        dis_outputX_his = []
+        dis_outputX_rotated_his = []
+        dis_outputS_his = []
+        dis_outputS_synthetic_his = []
+
+    with torch.no_grad():
+        for _, datas in enumerate(valid_loader):
+            # Dataloader = (img, synthetic S)
+            _, synthetic_S, gt, idx = datas
+
+            # (b, h, w) --> (b, c, h, w) in this case, (b, h, w) --> (b, 1, h, w)
+            img = torch.randn((gt.shape[0], 1, 1, opt.nz)).to(device)
+            img = torch.reshape(modelMLP(img), (gt.shape[0], 1, opt.patch_size, opt.patch_size))
+            img2 = torch.randn((gt.shape[0], 1, 1, opt.nz)).to(device)
+            img2 = torch.reshape(modelMLP(img2), (gt.shape[0], 1, opt.patch_size, opt.patch_size))
+            synthetic_S = synthetic_S.unsqueeze(1)
+            gt = gt.unsqueeze(1)
+
+            # Normalize using 99% percentile value (0~65525 -> 0~1.6)
+            high_gt = torch.quantile(gt, 0.99)
+            gt = gt / high_gt
+
+            # Normalize synthetic S using max value (0~65525 -> 0.5~1) --> normalize [a, b] = (b-a)*(x-Minx)/(Maxx-Minx)+a
+            high_s = torch.max(synthetic_S)
+            synthetic_S = synthetic_S / high_s
+            # (optional) to make sure that 'synthetic S' has values more than 0.1 at least.
+            synthetic_S = torch.maximum(synthetic_S, torch.ones_like(synthetic_S) * 0.1)
+
+            synthetic_S = synthetic_S.to(device)
+            gt = gt.to(device)
+
+            # 1. Y'' --[Enc1]-> 1D vector S --[extend]-> S'
+            _, mask = modelUNet_for_S(img)
+
+            # 2. Y'' --[Enc2]-> 2D feature X --[Dec2]-> X'
+            output = modelUNet_for_X(img2)
+
+            # 3. {X, rotated X} --[Discriminator_for_X]-> 0/1
+            dis_outputX = modelDiscriminator_for_X(output.detach())
+            dis_outputX_rotated = modelDiscriminator_for_X(gt.detach())
+
+            # 4. {S, synthetic S} --[Discriminator_for_S]-> 0/1
+            dis_outputS = modelDiscriminator_for_S(mask.detach())
+            dis_outputS_synthetic = modelDiscriminator_for_S(synthetic_S.detach())
+
+            ### loss for check if 'GT' and our 'output X' is same. ###
+            loss_check_valid = criterion(gt, output)
+            total_loss_check_valid.append(loss_check_valid.item())
+            ##########################################################
+
+
+            if (e + 1) % opt.valid_save_period == 0:
+                ############# PNG Image Array Save #############
+                img_grid = make_grid(img, padding=2, pad_value=1)
+                synthetic_S_grid = make_grid(synthetic_S, padding=2, pad_value=1)
+                mask_grid = make_grid(mask, padding=2, pad_value=1)
+                gt_grid = make_grid(gt, padding=2, pad_value=1)
+                output_temp = output * high_gt
+                output_temp_flat = torch.flatten(output_temp, start_dim=1, end_dim=-1)
+                output_temp /= torch.quantile(output_temp_flat, 0.99, dim=1)[..., None, None, None]
+                output_grid = make_grid(output_temp, padding=2, pad_value=1)
+                color_grid = make_grid(torch.cat([output, gt, torch.zeros_like(gt)], dim=1), padding=2, pad_value=1)
+
+                save_grid = torch.cat([img_grid, synthetic_S_grid, mask_grid, gt_grid, output_grid, color_grid], dim=1)
+                save_image(save_grid, f'{valid_array_save_path}/e{e + 1}_{idx[0]}-{idx[-1]}.png')
+                ################################################
+
+                for i in range(opt.valid_batch_size):
+                    valid_idx = idx[i]
+
+                    ############# Discriminator histogram #############
+                    dis_outputX_temp = dis_outputX[i].item()
+                    dis_outputX_rotated_temp = dis_outputX_rotated[i].item()
+                    dis_outputS_temp = dis_outputS[i].item()
+                    dis_outputS_synthetic_temp = dis_outputS_synthetic[i].item()
+
+                    dis_outputX_his.append(dis_outputX_temp)
+                    dis_outputX_rotated_his.append(dis_outputX_rotated_temp)
+                    dis_outputS_his.append(dis_outputS_temp)
+                    dis_outputS_synthetic_his.append(dis_outputS_synthetic_temp)
+                    ###################################################
+
+                    ############# Image Save #############
+                    mask_vis = mask[i].squeeze().detach().cpu().numpy()
+                    io.imsave(f'{valid_save_path}/e{e+1}_{valid_idx}_maskS_{dis_outputS_temp:.3f}.tif', mask_vis)
+
+                    synthetic_S_vis = synthetic_S[i].squeeze().detach().cpu().numpy()
+                    io.imsave(f'{valid_save_path}/e{e+1}_{valid_idx}_syntheticS_{dis_outputS_synthetic_temp:.3f}.tif', synthetic_S_vis)
+
+                    output_vis = output[i].squeeze().detach().cpu()
+                    output_vis = (output_vis * high_gt).numpy().astype('uint16')  # denormalize using only max
+                    io.imsave(f'{valid_save_path}/e{e+1}_{valid_idx}_outputX_{dis_outputX_temp:.3f}_r{dis_outputX_rotated_temp:.3f}.tif', output_vis)
+                    ######################################
+
+        ### loss for check if 'GT' and our 'output X' is same. ###
+        total_loss_check_valid = sum(total_loss_check_valid) / len(total_loss_check_valid)
+        total_loss_check_valid_ep.append(total_loss_check_valid)
+        ##########################################################
+
+        if (e + 1) % opt.valid_save_period == 0:
+            ############# Discriminator histogram #############
+            plt.figure()
+            plt.hist(dis_outputX_his, alpha=0.5, label='X (0)', range=(0, 1), bins=20)
+            plt.hist(dis_outputX_rotated_his, alpha=0.5, label='rotated X (1)', range=(0, 1), bins=20)
+            plt.title('Discriminator output of {X, rotated X}')
+            plt.xlabel('Discriminator output value (0~1)')
+            plt.ylabel('# of images')
+            plt.legend()
+            plt.savefig(f'{valid_array_save_path}/e{e+1}_histogram_X.png')
+
+            plt.figure()
+            plt.hist(dis_outputS_his, alpha=0.5, label='S (0)', range=(0, 1), bins=20)
+            plt.hist(dis_outputS_synthetic_his, alpha=0.5, label='synthetic S (1)', range=(0, 1), bins=20)
+            plt.title('Discriminator output of {S, synthetic S}')
+            plt.xlabel('Discriminator output value (0~1)')
+            plt.ylabel('# of images')
+            plt.legend()
+            plt.savefig(f'{valid_array_save_path}/e{e + 1}_histogram_S.png')
+            ###################################################
+
+
+    ############################################
+    # Save loss curves [[1, 2, 3, total], [4, X, 5, S]]
+    epoch_ep_n = np.array(epoch_ep)
+    fig, ax = plt.subplots(2, 4, figsize=(20, 8), layout='constrained')
+
+    ax[0, 0].plot(epoch_ep_n, np.array(train_loss1_ep))
+    ax[0, 0].set_title(f'Loss1')
+
+    ax[0, 1].plot(epoch_ep_n, np.array(train_loss2_ep))
+    ax[0, 1].set_title(f'Loss2')
+
+    ax[0, 2].plot(epoch_ep_n, np.array(train_loss3_ep))
+    ax[0, 2].set_title(f'Loss3')
+
+    ax[0, 3].set_title('Total loss')
+    ax[0, 3].plot(epoch_ep_n, np.array(train_loss_ep))
+
+    ax[1, 0].plot(epoch_ep_n, np.array(train_loss4_ep))
+    ax[1, 0].set_title(f'{str(opt.c)} * Loss4')
+
+    ax[1, 1].plot(epoch_ep_n, np.array(train_lossDisX_ep))
+    ax[1, 1].set_title(f'Loss DisX')
+
+    ax[1, 2].plot(epoch_ep_n, np.array(train_loss5_ep))
+    ax[1, 2].set_title(f'{str(opt.d)} * Loss5')
+
+    ax[1, 3].plot(epoch_ep_n, np.array(train_lossDisS_ep))
+    ax[1, 3].set_title('Loss DisS')
+
+    fig.supxlabel('Epoch')
+    fig.supylabel('Loss')
+    plt.savefig(f'{plot_path}/loss_curve.png')
+
+    ### loss for check if 'GT' and our 'output X' is same. ###
+    plt.figure()
+    plt.plot(epoch_ep_n, np.array(total_loss_check_train_ep), label='train loss')
+    plt.plot(epoch_ep_n, np.array(total_loss_check_valid_ep), label='valid loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('MSE loss of {GT, output}')
+    plt.legend(loc='upper right')
+    plt.savefig(f'{plot_path}/check_loss.png')
+    ##########################################################
+
+    ############################################
+
+    if (e + 1) % opt.model_save_period == 0:
+        torch.save(modelUNet_for_S.state_dict(), f"{model_path}/UNet_for_S_{e+1}_{total_train_loss:.4f}.pth")
+        torch.save(modelUNet_for_X.state_dict(), f"{model_path}/UNet_for_X_{e+1}_{total_train_loss:.4f}.pth")
+        torch.save(modelDiscriminator_for_S.state_dict(), f"{model_path}/Discriminator_for_S_{e+1}_{total_lossDisS:.4f}.pth")
+        torch.save(modelDiscriminator_for_X.state_dict(), f"{model_path}/Discriminator_for_X_{e+1}_{total_lossDisX:.4f}.pth")
