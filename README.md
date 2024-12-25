@@ -5,7 +5,7 @@
 
 ## Goal
 <p align="center">
-<img width="70%" src="https://github.com/user-attachments/assets/cbf3e94f-45bb-48a2-a4d3-3870b06aa98f.gif">
+<img width="70%" src="https://github.com/sungjin1098/LSFM_line-artifact_removal/issues/1#issue-2758776487.gif">
 </p>
 <p align="center">
 <img width="70%" src="Figure/Fig_2.png">
