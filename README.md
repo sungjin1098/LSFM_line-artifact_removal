@@ -5,7 +5,7 @@
 
 ## Goal
 <p align="center">
-<img width="70%" src="![Fig_1](https://github.com/user-attachments/assets/7eb12011-35f9-491d-8bb7-3e18efcf6cc3)">
+<img width="70%" src="https://github.com/user-attachments/assets/cbf3e94f-45bb-48a2-a4d3-3870b06aa98f.gif">
 </p>
 <p align="center">
 <img width="70%" src="Figure/Fig_2.png">
