@@ -1,7 +1,7 @@
 # Line artifact removal in LSFM
 
 *Last update: 01/04/2024* <br/>
-* All codes, explanation files and dataset are here: \143.248.159.179\Lab_share\01_data\Minyoung
+* All codes, explanation files and dataset are here: \143.248.159.179\Lab_share\01_data\Sungjin
 
 ## Goal
 <p align="center">
@@ -23,7 +23,7 @@ The network consists of two main parts:
 
 ## Dataset
 * You can download the dataset in NAS **143.248.159.179** <br/>
-(Lab_share/01_data/Minyoung/230118_Line_Artifact_Removal/dataset)
+(Lab_share/01_data/Sungjin/230118_Line_Artifact_Removal/dataset)
   
 ### Synthetic dataset
     dataset/
